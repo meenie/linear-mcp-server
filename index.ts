@@ -18,6 +18,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
 import { z } from 'zod';
+import crypto from 'crypto';
+import Bottleneck from 'bottleneck';
 
 interface CreateIssueArgs {
   title: string;
@@ -77,92 +79,88 @@ interface LinearIssueResponse {
   url: string;
 }
 
-class RateLimiter {
+class BottleneckRateLimiter {
   public readonly requestsPerHour = 1400;
-  private queue: (() => Promise<any>)[] = [];
-  private processing = false;
-  private lastRequestTime = 0;
-  private readonly minDelayMs = 3600000 / this.requestsPerHour;
+  private limiter: Bottleneck;
   private requestTimes: number[] = [];
   private requestTimestamps: number[] = [];
+  private lastRequestTime = 0;
 
-  async enqueue<T>(fn: () => Promise<T>, operation?: string): Promise<T> {
-    const startTime = Date.now();
-    const queuePosition = this.queue.length;
+  private readonly ONE_HOUR_MS = 60 * 60 * 1000;
 
-    console.error(`[Linear API] Enqueueing request${operation ? ` for ${operation}` : ''} (Queue position: ${queuePosition})`);
+  constructor() {
+    this.limiter = new Bottleneck({
+      reservoir: this.requestsPerHour,          // Initial number of requests
+      reservoirRefreshAmount: this.requestsPerHour, // Number of requests to add
+      reservoirRefreshInterval: this.ONE_HOUR_MS, // Refresh interval (1 hour)
+      maxConcurrent: 5,                 // Maximum number of concurrent requests
+    });
 
-    return new Promise((resolve, reject) => {
-      this.queue.push(async () => {
-        try {
-          console.error(`[Linear API] Starting request${operation ? ` for ${operation}` : ''}`);
-          const result = await fn();
-          const endTime = Date.now();
-          const duration = endTime - startTime;
+    // Set up events to track requests
+    this.limiter.on('received', () => {
+      // When a job is received in the queue
+      console.error(`[Linear API] Job added to queue (Queue size: ${this.limiter.queued()})`);
+    });
 
-          console.error(`[Linear API] Completed request${operation ? ` for ${operation}` : ''} (Duration: ${duration}ms)`);
-          this.trackRequest(startTime, endTime, operation);
-          resolve(result);
-        } catch (error) {
-          console.error(`[Linear API] Error in request${operation ? ` for ${operation}` : ''}: `, error);
-          reject(error);
-        }
-      });
-      this.processQueue();
+    this.limiter.on('done', () => {
+      console.error(`[Linear API] Completed request`);
+    });
+
+    this.limiter.on('failed', (error) => {
+      console.error(`[Linear API] Failed request: `, error);
     });
   }
 
-  private async processQueue() {
-    if (this.processing || this.queue.length === 0) return;
-    this.processing = true;
+  async enqueue<T>(fn: () => Promise<T>, operation?: string): Promise<T> {
+    console.error(`[Linear API] Enqueueing request${operation ? ` for ${operation}` : ''}`);
 
-    while (this.queue.length > 0) {
-      const now = Date.now();
-      const timeSinceLastRequest = now - this.lastRequestTime;
-
-      const requestsInLastHour = this.requestTimestamps.filter(t => t > now - 3600000).length;
-      if (requestsInLastHour >= this.requestsPerHour * 0.9 && timeSinceLastRequest < this.minDelayMs) {
-        const waitTime = this.minDelayMs - timeSinceLastRequest;
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
-
-      const fn = this.queue.shift();
-      if (fn) {
-        this.lastRequestTime = Date.now();
-        await fn();
-      }
+    const startTime = Date.now();
+    try {
+      // Use simple id option with operation name
+      const id = operation ? `${operation}-${crypto.randomUUID()}` : undefined;
+      const result = await this.limiter.schedule({ id }, fn);
+      const endTime = Date.now();
+      this.trackRequest(startTime, endTime);
+      return result;
+    } catch (error) {
+      console.error(`[Linear API] Error in request${operation ? ` for ${operation}` : ''}: `, error);
+      throw error;
     }
-
-    this.processing = false;
   }
 
   async batch<T>(items: any[], batchSize: number, fn: (item: any) => Promise<T>, operation?: string): Promise<T[]> {
-    const batches = [];
+    const results = [];
+
+    // Process in batches of batchSize
     for (let i = 0; i < items.length; i += batchSize) {
       const batch = items.slice(i, i + batchSize);
-      batches.push(Promise.all(
-        batch.map(item => this.enqueue(() => fn(item), operation))
-      ));
+      const batchPromises = batch.map((item) => {
+        return this.enqueue(() => fn(item), operation);
+      });
+
+      // Wait for current batch to complete before processing next batch
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
     }
 
-    const results = await Promise.all(batches);
-    return results.flat();
+    return results;
   }
 
-  private trackRequest(startTime: number, endTime: number, operation?: string) {
+  private trackRequest(startTime: number, endTime: number) {
     const duration = endTime - startTime;
     this.requestTimes.push(duration);
     this.requestTimestamps.push(startTime);
+    this.lastRequestTime = endTime;
 
     // Keep only last hour of requests
-    const oneHourAgo = Date.now() - 3600000;
+    const oneHourAgo = Date.now() - this.ONE_HOUR_MS;
     this.requestTimestamps = this.requestTimestamps.filter(t => t > oneHourAgo);
     this.requestTimes = this.requestTimes.slice(-this.requestTimestamps.length);
   }
 
   getMetrics(): RateLimiterMetrics {
     const now = Date.now();
-    const oneHourAgo = now - 3600000;
+    const oneHourAgo = now - this.ONE_HOUR_MS;
     const recentRequests = this.requestTimestamps.filter(t => t > oneHourAgo);
 
     return {
@@ -171,7 +169,7 @@ class RateLimiter {
       averageRequestTime: this.requestTimes.length > 0
         ? this.requestTimes.reduce((a, b) => a + b, 0) / this.requestTimes.length
         : 0,
-      queueLength: this.queue.length,
+      queueLength: this.limiter.queued(),
       lastRequestTime: this.lastRequestTime
     };
   }
@@ -179,12 +177,12 @@ class RateLimiter {
 
 class LinearMCPClient {
   private client: LinearClient;
-  public readonly rateLimiter: RateLimiter;
+  public readonly rateLimiter: BottleneckRateLimiter;
 
   constructor(apiKey: string) {
     if (!apiKey) throw new Error("LINEAR_API_KEY environment variable is required");
     this.client = new LinearClient({ apiKey });
-    this.rateLimiter = new RateLimiter();
+    this.rateLimiter = new BottleneckRateLimiter();
   }
 
   private async getIssueDetails(issue: Issue) {
@@ -208,11 +206,20 @@ class LinearMCPClient {
   }
 
   private addMetricsToResponse(response: any) {
+    if (Array.isArray(response)) {
+      return response.map(item => this.addMetrics(item));
+    }
+
+    return this.addMetrics(response);
+  }
+
+  private addMetrics(response: any) {
     const metrics = this.rateLimiter.getMetrics();
+    console.error(`[Linear API] Metrics: ${JSON.stringify(metrics)}`);
     return {
       ...response,
       metadata: {
-        ...response.metadata,
+        ...(response.metadata || {}),
         apiMetrics: {
           requestsInLastHour: metrics.requestsInLastHour,
           remainingRequests: this.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
@@ -335,7 +342,7 @@ class LinearMCPClient {
         labels: labels?.nodes?.map((label: IssueLabel) => label.name) || [],
         url: issue.url
       };
-    });
+    }, "searchIssues");
 
     return this.addMetricsToResponse(issuesWithDetails);
   }
@@ -423,7 +430,7 @@ class LinearMCPClient {
         assignee: assignee?.name,
         url: issue.url
       };
-    });
+    }, "getTeamIssues");
 
     return this.addMetricsToResponse(issuesWithDetails);
   }
@@ -960,8 +967,8 @@ async function main() {
               content: [{
                 type: "text",
                 text: `Created issue ${issue.identifier}: ${issue.title}\nURL: ${issue.url}`,
-                metadata: baseResponse
-              }]
+              }],
+              metadata: baseResponse,
             };
           }
 
@@ -972,8 +979,8 @@ async function main() {
               content: [{
                 type: "text",
                 text: `Updated issue ${issue.identifier}\nURL: ${issue.url}`,
-                metadata: baseResponse
-              }]
+              }],
+              metadata: baseResponse,
             };
           }
 
@@ -988,8 +995,8 @@ async function main() {
                     `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.status || 'None'}\n  ${issue.url}`
                   ).join('\n')
                 }`,
-                metadata: baseResponse
-              }]
+              }],
+              metadata: baseResponse,
             };
           }
 
@@ -1005,8 +1012,8 @@ async function main() {
                     `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.stateName}\n  ${issue.url}`
                   ).join('\n')
                 }`,
-                metadata: baseResponse
-              }]
+              }],
+              metadata: baseResponse,
             };
           }
 
@@ -1018,8 +1025,8 @@ async function main() {
               content: [{
                 type: "text",
                 text: `Added comment to issue ${issue?.identifier}\nURL: ${comment.url}`,
-                metadata: baseResponse
-              }]
+              }],
+              metadata: baseResponse,
             };
           }
 
@@ -1045,7 +1052,7 @@ async function main() {
             message: err.message,
             code: 'VALIDATION_ERROR'
           }));
-          
+
           return {
             content: [{
               type: "text",
@@ -1056,11 +1063,11 @@ async function main() {
                   details: formattedErrors
                 }
               },
-              metadata: {
-                error: true,
-                ...errorResponse
-              }
-            }]
+            }],
+            metadata: {
+              error: true,
+              ...errorResponse
+            }
           };
         }
 
@@ -1081,11 +1088,11 @@ async function main() {
                   }
                 }
               },
-              metadata: {
-                error: true,
-                ...errorResponse
-              }
-            }]
+            }],
+            metadata: {
+              error: true,
+              ...errorResponse
+            }
           };
         }
 
@@ -1099,11 +1106,11 @@ async function main() {
                 message: error instanceof Error ? error.message : String(error)
               }
             },
-            metadata: {
-              error: true,
-              ...errorResponse
-            }
-          }]
+          }],
+          metadata: {
+            error: true,
+            ...errorResponse
+          }
         };
       }
     });
