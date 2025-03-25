@@ -44,13 +44,13 @@ npx @smithery/cli install linear-mcp-server --client claude
 
 ### Tools
 
-1. **`linear_create_issue`**: Create a new Linear issues
+1. **`linear_create_issue`**: Create a new Linear issue
    - Required inputs:
      - `title` (string): Issue title
      - `teamId` (string): Team ID to create issue in
    - Optional inputs:
      - `description` (string): Issue description (markdown supported)
-     - `priority` (number, 0-4): Priority level (1=urgent, 4=low)
+     - `priority` (number, 0-4): Priority level (0-4, where lower is higher priority)
      - `status` (string): Initial status name
 
 2. **`linear_update_issue`**: Update existing issues
@@ -65,11 +65,14 @@ npx @smithery/cli install linear-mcp-server --client claude
 3. **`linear_search_issues`**: Search issues with flexible filtering
    - Optional inputs:
      - `query` (string): Text to search in title/description
+     - `identifier` (string): Search by specific ticket identifier (e.g., 'ABC-123')
      - `teamId` (string): Filter by team
-     - `status` (string): Filter by status
-     - `assigneeId` (string): Filter by assignee
-     - `labels` (string[]): Filter by labels
-     - `priority` (number): Filter by priority
+     - `status` (string): Filter by status name (e.g., 'In Progress', 'Done')
+     - `assigneeId` (string): Filter by assignee's user ID
+     - `labels` (string[]): Filter by label names
+     - `priority` (number): Filter by priority (1=urgent, 2=high, 3=normal, 4=low)
+     - `estimate` (number): Filter by estimate points
+     - `includeArchived` (boolean): Include archived issues
      - `limit` (number, default: 10): Max results
 
 4. **`linear_get_user_issues`**: Get issues assigned to a user
@@ -80,7 +83,7 @@ npx @smithery/cli install linear-mcp-server --client claude
 
 5. **`linear_add_comment`**: Add comments to issues
    - Required inputs:
-     - `issueId` (string): Issue ID to comment on
+     - `identifier` (string): Linear issue identifier (e.g., 'ABC-123')
      - `body` (string): Comment text (markdown supported)
    - Optional inputs:
      - `createAsUser` (string): Custom username
@@ -88,25 +91,35 @@ npx @smithery/cli install linear-mcp-server --client claude
 
 ### Resources
 
-- `linear-issue:///{issueId}` - View individual issue details
-- `linear-team:///{teamId}/issues` - View team issues
-- `linear-user:///{userId}/assigned` - View user's assigned issues
-- `linear-organization:` - View organization info
-- `linear-viewer:` - View current user context
+- `linear-issue://{issueId}` - View individual issue details
+- `linear-team://{teamId}` - View team issues
+- `linear-user://{userId}` - View user's assigned issues
+- `linear-search://{query}` - Search for issues with a query string or ticket identifier
+- `linear-priority://{level}` - Find issues matching a specific priority level
+- `linear-organization://` - View organization info
+- `linear-viewer://` - View current user context
+- `linear-my-issues://` - View all issues assigned to you
+- `linear-my-backlog://` - View your backlog issues
+- `linear-my-planned://` - View your planned issues for current cycle
+- `linear-my-in-progress://` - View your in-progress issues
+- `linear-my-under-review://` - View your issues under review
+- `linear-my-high-priority://` - View your high priority issues
 
 ## Usage examples
 
 Some example prompts you can use with Claude Desktop to interact with Linear:
 
-1. "Show me all my high-**priority** issues" → execute the `search_issues` tool and/or `linear-user:///{userId}/assigned` to find issues assigned to you with priority 1
+1. "Show me all my high-priority issues" → execute the `linear_search_issues` tool and/or `linear-my-high-priority://` to find issues assigned to you with high priority
 
-2. "Based on what I've told you about this bug already, make a bug report for the authentication system" → use `create_issue` to create a new high-priority issue with appropriate details and status tracking
+2. "Based on what I've told you about this bug already, make a bug report for the authentication system" → use `linear_create_issue` to create a new issue with appropriate details and status tracking
 
-3. "Find all in progress frontend tasks" → use `search_issues` to locate frontend-related issues with in progress task
+3. "Find all in progress frontend tasks" → use `linear_search_issues` to locate frontend-related issues with in progress status
 
-4. "Give me a summary of recent updates on the issues for mobile app development" → use `search_issues` to identify the relevant issue(s), then `linear-issue:///{issueId}` fetch the issue details and show recent activity and comments
+4. "Give me a summary of recent updates on the issues for mobile app development" → use `linear_search_issues` to identify the relevant issue(s), then `linear-issue://{issueId}` fetch the issue details and show recent activity and comments
 
-5. "What's the current workload for the mobile team?" → combine `linear-team:///{teamId}/issues` and `search_issues` to analyze issue distribution and priorities across the mobile team
+5. "What's the current workload for the mobile team?" → use `linear-team://{teamId}` to analyze issue distribution and priorities across the mobile team
+
+6. "Look up ticket FE-123" → use `linear_search_issues` with the `identifier` parameter or `linear-search://FE-123` to find a specific Linear ticket by its identifier
 
 ## Development
 
@@ -116,13 +129,13 @@ Some example prompts you can use with Claude Desktop to interact with Linear:
 npm install
 ```
 
-1. Configure Linear API key in `.env`:
+2. Configure Linear API key in `.env`:
 
 ```bash
 LINEAR_API_KEY=your_api_key_here
 ```
 
-1. Build the server:
+3. Build the server:
 
 ```bash
 npm run build

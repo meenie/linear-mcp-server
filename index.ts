@@ -4,7 +4,6 @@ import { LinearClient, LinearDocument, Issue, User, Team, WorkflowState, IssueLa
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequest,
   CallToolRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
@@ -18,6 +17,19 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
 import { z } from 'zod';
+
+/**
+ * Linear MCP Server
+ *
+ * This server provides access to Linear API functionality through the Model Context Protocol.
+ *
+ * Logging approach:
+ * - We use a singleton Logger class that logs to console.error and sends logs via MCP
+ * - The Logger uses server.sendLoggingMessage() only after the server is fully connected
+ * - We track connection state to avoid "Not connected" errors
+ * - The server needs the "logging" capability in its configuration
+ * - Always use logger.info/warning/error instead of console.* methods
+ */
 
 interface CreateIssueArgs {
   title: string;
@@ -45,6 +57,7 @@ interface SearchIssuesArgs {
   priority?: number;
   estimate?: number;
   includeArchived?: boolean;
+  identifier?: string;
 }
 
 interface GetUserIssuesArgs {
@@ -54,137 +67,95 @@ interface GetUserIssuesArgs {
 }
 
 interface AddCommentArgs {
-  issueId: string;
+  identifier: string;
   body: string;
   createAsUser?: string;
   displayIconUrl?: string;
 }
 
-interface RateLimiterMetrics {
-  totalRequests: number;
-  requestsInLastHour: number;
-  averageRequestTime: number;
-  queueLength: number;
-  lastRequestTime: number;
-}
-
 interface LinearIssueResponse {
+  id?: string;
   identifier: string;
   title: string;
+  description?: string;
   priority: number | null;
+  estimate?: number;
   status: string | null;
   stateName?: string;
+  assignee?: string | null;
+  labels?: string[];
   url: string;
+  latestComment?: {
+    body: string;
+    createdAt: string;
+    userName: string;
+  } | null;
 }
 
-class RateLimiter {
-  public readonly requestsPerHour = 1400;
-  private queue: (() => Promise<any>)[] = [];
-  private processing = false;
-  private lastRequestTime = 0;
-  private readonly minDelayMs = 3600000 / this.requestsPerHour;
-  private requestTimes: number[] = [];
-  private requestTimestamps: number[] = [];
+// Create a global logger class that integrates with MCP
+class Logger {
+  private static instance: Logger;
+  private server: Server | null = null;
+  private isServerConnected: boolean = false;
 
-  async enqueue<T>(fn: () => Promise<T>, operation?: string): Promise<T> {
-    const startTime = Date.now();
-    const queuePosition = this.queue.length;
+  private constructor() {}
 
-    console.error(`[Linear API] Enqueueing request${operation ? ` for ${operation}` : ''} (Queue position: ${queuePosition})`);
-
-    return new Promise((resolve, reject) => {
-      this.queue.push(async () => {
-        try {
-          console.error(`[Linear API] Starting request${operation ? ` for ${operation}` : ''}`);
-          const result = await fn();
-          const endTime = Date.now();
-          const duration = endTime - startTime;
-
-          console.error(`[Linear API] Completed request${operation ? ` for ${operation}` : ''} (Duration: ${duration}ms)`);
-          this.trackRequest(startTime, endTime, operation);
-          resolve(result);
-        } catch (error) {
-          console.error(`[Linear API] Error in request${operation ? ` for ${operation}` : ''}: `, error);
-          reject(error);
-        }
-      });
-      this.processQueue();
-    });
+  public static getInstance(): Logger {
+    if (!Logger.instance) {
+      Logger.instance = new Logger();
+    }
+    return Logger.instance;
   }
 
-  private async processQueue() {
-    if (this.processing || this.queue.length === 0) return;
-    this.processing = true;
+  public setServer(server: Server): void {
+    this.server = server;
+  }
 
-    while (this.queue.length > 0) {
-      const now = Date.now();
-      const timeSinceLastRequest = now - this.lastRequestTime;
+  public setServerConnected(connected: boolean): void {
+    this.isServerConnected = connected;
+  }
 
-      const requestsInLastHour = this.requestTimestamps.filter(t => t > now - 3600000).length;
-      if (requestsInLastHour >= this.requestsPerHour * 0.9 && timeSinceLastRequest < this.minDelayMs) {
-        const waitTime = this.minDelayMs - timeSinceLastRequest;
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
+  public log(level: "info" | "warning" | "error", message: string): void {
+    // Always log to console.error for server-side visibility
+    console.error(`[${level.toUpperCase()}] ${message}`);
 
-      const fn = this.queue.shift();
-      if (fn) {
-        this.lastRequestTime = Date.now();
-        await fn();
+    // Only try to send logs via MCP if server is connected
+    if (this.server && this.isServerConnected) {
+      try {
+        this.server.sendLoggingMessage({
+          level,
+          data: message
+        });
+      } catch (error) {
+        console.error(`Error sending log via MCP: ${error}`);
+        // Don't log the error to avoid infinite loops
+        // Just silently fall back to console logging
       }
     }
-
-    this.processing = false;
   }
 
-  async batch<T>(items: any[], batchSize: number, fn: (item: any) => Promise<T>, operation?: string): Promise<T[]> {
-    const batches = [];
-    for (let i = 0; i < items.length; i += batchSize) {
-      const batch = items.slice(i, i + batchSize);
-      batches.push(Promise.all(
-        batch.map(item => this.enqueue(() => fn(item), operation))
-      ));
-    }
-
-    const results = await Promise.all(batches);
-    return results.flat();
+  public info(message: string): void {
+    this.log("info", message);
   }
 
-  private trackRequest(startTime: number, endTime: number, operation?: string) {
-    const duration = endTime - startTime;
-    this.requestTimes.push(duration);
-    this.requestTimestamps.push(startTime);
-
-    // Keep only last hour of requests
-    const oneHourAgo = Date.now() - 3600000;
-    this.requestTimestamps = this.requestTimestamps.filter(t => t > oneHourAgo);
-    this.requestTimes = this.requestTimes.slice(-this.requestTimestamps.length);
+  public warning(message: string): void {
+    this.log("warning", message);
   }
 
-  getMetrics(): RateLimiterMetrics {
-    const now = Date.now();
-    const oneHourAgo = now - 3600000;
-    const recentRequests = this.requestTimestamps.filter(t => t > oneHourAgo);
-
-    return {
-      totalRequests: this.requestTimestamps.length,
-      requestsInLastHour: recentRequests.length,
-      averageRequestTime: this.requestTimes.length > 0
-        ? this.requestTimes.reduce((a, b) => a + b, 0) / this.requestTimes.length
-        : 0,
-      queueLength: this.queue.length,
-      lastRequestTime: this.lastRequestTime
-    };
+  public error(message: string): void {
+    this.log("error", message);
   }
 }
+
+// Get the global logger instance
+const logger = Logger.getInstance();
 
 class LinearMCPClient {
   private client: LinearClient;
-  public readonly rateLimiter: RateLimiter;
 
   constructor(apiKey: string) {
     if (!apiKey) throw new Error("LINEAR_API_KEY environment variable is required");
     this.client = new LinearClient({ apiKey });
-    this.rateLimiter = new RateLimiter();
   }
 
   private async getIssueDetails(issue: Issue) {
@@ -195,9 +166,9 @@ class LinearMCPClient {
     ];
 
     const [state, assignee, team] = await Promise.all([
-      this.rateLimiter.enqueue(async () => statePromise ? await statePromise : null),
-      this.rateLimiter.enqueue(async () => assigneePromise ? await assigneePromise : null),
-      this.rateLimiter.enqueue(async () => teamPromise ? await teamPromise : null)
+      statePromise ? await statePromise : null,
+      assigneePromise ? await assigneePromise : null,
+      teamPromise ? await teamPromise : null
     ]);
 
     return {
@@ -207,39 +178,17 @@ class LinearMCPClient {
     };
   }
 
-  private addMetricsToResponse(response: any) {
-    const metrics = this.rateLimiter.getMetrics();
-    return {
-      ...response,
-      metadata: {
-        ...response.metadata,
-        apiMetrics: {
-          requestsInLastHour: metrics.requestsInLastHour,
-          remainingRequests: this.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
-          averageRequestTime: `${Math.round(metrics.averageRequestTime)}ms`,
-          queueLength: metrics.queueLength,
-          lastRequestTime: new Date(metrics.lastRequestTime).toISOString()
-        }
-      }
-    };
-  }
-
   async listIssues() {
-    const result = await this.rateLimiter.enqueue(
-      () => this.client.issues({
-        first: 50,
-        orderBy: LinearDocument.PaginationOrderBy.UpdatedAt
-      }),
-      'listIssues'
-    );
+    const result = await this.client.issues({
+      first: 50,
+      orderBy: LinearDocument.PaginationOrderBy.UpdatedAt
+    });
 
-    const issuesWithDetails = await this.rateLimiter.batch(
-      result.nodes,
-      5,
-      async (issue) => {
+    const issuesWithDetails = await Promise.all(
+      result.nodes.map(async (issue) => {
         const details = await this.getIssueDetails(issue);
         return {
-          uri: `linear-issue:///${issue.id}`,
+          uri: `linear-issue://${issue.id}`,
           mimeType: "application/json",
           name: issue.title,
           description: `Linear issue ${issue.identifier}: ${issue.title}`,
@@ -251,20 +200,19 @@ class LinearMCPClient {
             team: details.team ? await details.team.name : undefined,
           }
         };
-      },
-      'getIssueDetails'
+      })
     );
 
-    return this.addMetricsToResponse(issuesWithDetails);
+    return issuesWithDetails;
   }
 
   async getIssue(issueId: string) {
-    const result = await this.rateLimiter.enqueue(() => this.client.issue(issueId));
+    const result = await this.client.issue(issueId);
     if (!result) throw new Error(`Issue ${issueId} not found`);
 
     const details = await this.getIssueDetails(result);
 
-    return this.addMetricsToResponse({
+    return {
       id: result.id,
       identifier: result.identifier,
       title: result.title,
@@ -274,7 +222,7 @@ class LinearMCPClient {
       assignee: details.assignee?.name,
       team: details.team?.name,
       url: result.url
-    });
+    };
   }
 
   async createIssue(args: CreateIssueArgs) {
@@ -308,109 +256,145 @@ class LinearMCPClient {
   }
 
   async searchIssues(args: SearchIssuesArgs) {
-    const result = await this.rateLimiter.enqueue(() =>
-      this.client.issues({
+    try {
+      const result = await this.client.issues({
         filter: this.buildSearchFilter(args),
         first: args.limit || 10,
         includeArchived: args.includeArchived
-      })
-    );
+      });
 
-    const issuesWithDetails = await this.rateLimiter.batch(result.nodes, 5, async (issue) => {
-      const [state, assignee, labels] = await Promise.all([
-        this.rateLimiter.enqueue(() => issue.state) as Promise<WorkflowState>,
-        this.rateLimiter.enqueue(() => issue.assignee) as Promise<User>,
-        this.rateLimiter.enqueue(() => issue.labels()) as Promise<{ nodes: IssueLabel[] }>
-      ]);
-
-      return {
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        description: issue.description,
-        priority: issue.priority,
-        estimate: issue.estimate,
-        status: state?.name || null,
-        assignee: assignee?.name || null,
-        labels: labels?.nodes?.map((label: IssueLabel) => label.name) || [],
-        url: issue.url
-      };
-    });
-
-    return this.addMetricsToResponse(issuesWithDetails);
-  }
-
-  async getUserIssues(args: GetUserIssuesArgs) {
-    try {
-      const user = args.userId && typeof args.userId === 'string' ?
-        await this.rateLimiter.enqueue(() => this.client.user(args.userId as string)) :
-        await this.rateLimiter.enqueue(() => this.client.viewer);
-
-      const result = await this.rateLimiter.enqueue(() => user.assignedIssues({
-        first: args.limit || 50,
-        includeArchived: args.includeArchived
-      }));
-
-      if (!result?.nodes) {
-        return this.addMetricsToResponse([]);
+      if (!result.nodes.length) {
+        return []; // Return empty array if no issues found
       }
 
-      const issuesWithDetails = await this.rateLimiter.batch(
-        result.nodes,
-        5,
-        async (issue) => {
-          const state = await this.rateLimiter.enqueue(() => issue.state) as WorkflowState;
+      const issuesWithDetails = await Promise.all(result.nodes.map(async (issue) => {
+        try {
+          const [state, assignee, labels, comments] = await Promise.all([
+            issue.state as Promise<WorkflowState>,
+            issue.assignee as Promise<User>,
+            issue.labels() as Promise<{ nodes: IssueLabel[] }>,
+            issue.comments({ first: 1 }) as Promise<{ nodes: any[] }>
+          ]);
+
+          const latestComment = comments.nodes.length > 0 ? {
+            body: comments.nodes[0].body,
+            createdAt: comments.nodes[0].createdAt,
+            user: comments.nodes[0].user ? await comments.nodes[0].user : null
+          } : null;
+
           return {
             id: issue.id,
             identifier: issue.identifier,
             title: issue.title,
             description: issue.description,
             priority: issue.priority,
-            stateName: state?.name || 'Unknown',
+            estimate: issue.estimate,
+            status: state ? state.name : null,
+            stateName: state ? state.name : undefined,
+            assignee: assignee ? assignee.name : null,
+            labels: labels?.nodes?.map((label: IssueLabel) => label.name) || [],
+            url: issue.url,
+            latestComment: latestComment ? {
+              body: latestComment.body,
+              createdAt: latestComment.createdAt,
+              userName: latestComment.user?.name || 'Unknown'
+            } : null
+          } as LinearIssueResponse;
+        } catch (error) {
+          logger.error(`Error getting issue details: ${error}`);
+          return null;
+        }
+      }));
+
+      // Filter out null values and cast to the correct type
+      return issuesWithDetails.filter(Boolean) as LinearIssueResponse[];
+    } catch (error) {
+      logger.error(`Error in searchIssues: ${error}`);
+      return [];
+    }
+  }
+
+  async getUserIssues(args: GetUserIssuesArgs): Promise<LinearIssueResponse[]> {
+    try {
+      const user = args.userId && typeof args.userId === 'string' ?
+        await this.client.user(args.userId as string) :
+        await this.client.viewer;
+
+      const result = await user.assignedIssues({
+        first: args.limit || 50,
+        includeArchived: args.includeArchived
+      });
+
+      if (!result?.nodes) {
+        return [];
+      }
+
+      const issuesWithDetails = await Promise.all(
+        result.nodes.map(async (issue) => {
+          const state = await issue.state as WorkflowState;
+          return {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description,
+            priority: issue.priority,
+            status: state?.name || null,
             url: issue.url
           };
-        },
-        'getUserIssues'
+        })
       );
 
-      return this.addMetricsToResponse(issuesWithDetails);
+      return issuesWithDetails;
     } catch (error) {
-      console.error(`Error in getUserIssues: ${error}`);
-      throw error;
+      logger.error(`Error in getUserIssues: ${error}`);
+      return [];
     }
   }
 
   async addComment(args: AddCommentArgs) {
+    // Create the comment
     const commentPayload = await this.client.createComment({
-      issueId: args.issueId,
+      issueId: args.identifier,
       body: args.body,
       createAsUser: args.createAsUser,
       displayIconUrl: args.displayIconUrl
     });
 
-    const comment = await commentPayload.comment;
-    if (!comment) throw new Error("Failed to create comment");
+    if (!commentPayload) throw new Error("Failed to create comment");
+    const commentObj = commentPayload.comment;
+    if (!commentObj) throw new Error("Failed to create comment");
 
-    const issue = await comment.issue;
+    // Need to await to get the actual properties
+    const comment = await commentObj;
+
+    // Fetch the issue to get its details
+    const issue = await this.client.issue(args.identifier);
+
     return {
-      comment,
-      issue
+      commentId: comment.id,
+      commentBody: comment.body,
+      commentUrl: comment.url,
+      issue: issue ? {
+        id: issue.id,
+        identifier: issue.identifier,
+        title: issue.title
+      } : null
     };
   }
 
   async getTeamIssues(teamId: string) {
-    const team = await this.rateLimiter.enqueue(() => this.client.team(teamId));
+    const team = await this.client.team(teamId);
     if (!team) throw new Error(`Team ${teamId} not found`);
 
-    const { nodes: issues } = await this.rateLimiter.enqueue(() => team.issues());
+    const { nodes: issues } = await team.issues();
 
-    const issuesWithDetails = await this.rateLimiter.batch(issues, 5, async (issue) => {
+    const issuesWithDetails = await Promise.all(issues.map(async (issue) => {
       const statePromise = issue.state;
       const assigneePromise = issue.assignee;
 
       const [state, assignee] = await Promise.all([
-        this.rateLimiter.enqueue(async () => statePromise ? await statePromise : null),
-        this.rateLimiter.enqueue(async () => assigneePromise ? await assigneePromise : null)
+        statePromise ? await statePromise : null,
+        assigneePromise ? await assigneePromise : null
       ]);
 
       return {
@@ -423,9 +407,9 @@ class LinearMCPClient {
         assignee: assignee?.name,
         url: issue.url
       };
-    });
+    }));
 
-    return this.addMetricsToResponse(issuesWithDetails);
+    return issuesWithDetails;
   }
 
   async getViewer() {
@@ -435,7 +419,7 @@ class LinearMCPClient {
       this.client.organization
     ]);
 
-    return this.addMetricsToResponse({
+    return {
       id: viewer.id,
       name: viewer.name,
       email: viewer.email,
@@ -450,7 +434,7 @@ class LinearMCPClient {
         name: organization.name,
         urlKey: organization.urlKey
       }
-    });
+    };
   }
 
   async getOrganization() {
@@ -460,7 +444,7 @@ class LinearMCPClient {
       organization.users()
     ]);
 
-    return this.addMetricsToResponse({
+    return {
       id: organization.id,
       name: organization.name,
       urlKey: organization.urlKey,
@@ -476,11 +460,29 @@ class LinearMCPClient {
         admin: user.admin,
         active: user.active
       }))
-    });
+    };
   }
 
   private buildSearchFilter(args: SearchIssuesArgs): any {
     const filter: any = {};
+
+    if (args.identifier) {
+      // Parse Linear ticket ID format (e.g., "ABC-123")
+      const match = args.identifier.match(/^([A-Z]+)-(\d+)$/);
+      if (match) {
+        const [_, teamKey, number] = match;
+        // Search for the specific issue by team key and number
+        filter.and = [
+          { team: { key: { eq: teamKey } } },
+          { number: { eq: parseInt(number, 10) } }
+        ];
+        return filter; // Return early as this is the most specific search
+      } else {
+        // Fallback to searching by identifier if the format doesn't match
+        filter.identifier = { eq: args.identifier };
+        return filter;
+      }
+    }
 
     if (args.query) {
       filter.or = [
@@ -555,11 +557,12 @@ const updateIssueTool: Tool = {
 
 const searchIssuesTool: Tool = {
   name: "linear_search_issues",
-  description: "Searches Linear issues using flexible criteria. Supports filtering by any combination of: title/description text, team, status, assignee, labels, priority (1=urgent, 2=high, 3=normal, 4=low), and estimate. Returns up to 10 issues by default (configurable via limit).",
+  description: "Search Linear issues using flexible criteria. Supports filtering by any combination of: title/description text, team, status, assignee, labels, priority (1=urgent, 2=high, 3=normal, 4=low), and estimate. You can also search by specific issue identifier (e.g., 'ABC-123'). Returns up to 10 issues by default (configurable via limit).",
   inputSchema: {
     type: "object",
     properties: {
       query: { type: "string", description: "Optional text to search in title and description" },
+      identifier: { type: "string", description: "Search by specific issue identifier (e.g., 'ABC-123')" },
       teamId: { type: "string", description: "Filter by team ID" },
       status: { type: "string", description: "Filter by status name (e.g., 'In Progress', 'Done')" },
       assigneeId: { type: "string", description: "Filter by assignee's user ID" },
@@ -607,18 +610,18 @@ const addCommentTool: Tool = {
   inputSchema: {
     type: "object",
     properties: {
-      issueId: { type: "string", description: "ID of the issue to comment on" },
+      identifier: { type: "string", description: "Linear issue identifier (e.g., 'ABC-123')" },
       body: { type: "string", description: "Comment text in markdown format" },
       createAsUser: { type: "string", description: "Optional custom username to show for the comment" },
       displayIconUrl: { type: "string", description: "Optional avatar URL for the comment" }
     },
-    required: ["issueId", "body"]
+    required: ["identifier", "body"]
   }
 };
 
 const resourceTemplates: ResourceTemplate[] = [
   {
-    uriTemplate: "linear-issue:///{issueId}",
+    uriTemplate: "linear-issue://{issueId}",
     name: "Linear Issue",
     description: "A Linear issue with its details, comments, and metadata. Use this to fetch detailed information about a specific issue.",
     parameters: {
@@ -628,29 +631,11 @@ const resourceTemplates: ResourceTemplate[] = [
       }
     },
     examples: [
-      "linear-issue:///c2b318fb-95d2-4a81-9539-f3268f34af87"
+      "linear-issue://c2b318fb-95d2-4a81-9539-f3268f34af87"
     ]
   },
   {
-    uriTemplate: "linear-viewer:",
-    name: "Current User",
-    description: "Information about the authenticated user associated with the API key, including their role, teams, and settings.",
-    parameters: {},
-    examples: [
-      "linear-viewer:"
-    ]
-  },
-  {
-    uriTemplate: "linear-organization:",
-    name: "Current Organization",
-    description: "Details about the Linear organization associated with the API key, including settings, teams, and members.",
-    parameters: {},
-    examples: [
-      "linear-organization:"
-    ]
-  },
-  {
-    uriTemplate: "linear-team:///{teamId}/issues",
+    uriTemplate: "linear-team://{teamId}",
     name: "Team Issues",
     description: "All active issues belonging to a specific Linear team, including their status, priority, and assignees.",
     parameters: {
@@ -660,11 +645,11 @@ const resourceTemplates: ResourceTemplate[] = [
       }
     },
     examples: [
-      "linear-team:///TEAM-123/issues"
+      "linear-team://TEAM-123"
     ]
   },
   {
-    uriTemplate: "linear-user:///{userId}/assigned",
+    uriTemplate: "linear-user://{userId}",
     name: "User Assigned Issues",
     description: "Active issues assigned to a specific Linear user. Returns issues sorted by update date.",
     parameters: {
@@ -674,90 +659,165 @@ const resourceTemplates: ResourceTemplate[] = [
       }
     },
     examples: [
-      "linear-user:///USER-123/assigned",
-      "linear-user:///me/assigned"
+      "linear-user://USER-123",
+      "linear-user://me"
+    ]
+  },
+  {
+    uriTemplate: "linear-search://{query}",
+    name: "Search Linear Issues",
+    description: "Search for Linear issues with a query string or a ticket identifier (e.g., 'ABC-123')",
+    parameters: {
+      query: {
+        type: "string",
+        description: "Search query for finding issues or a ticket identifier (e.g., 'ABC-123')"
+      }
+    },
+    examples: [
+      "linear-search://bug",
+      "linear-search://priority:high",
+      "linear-search://ABC-123"
+    ]
+  },
+  {
+    uriTemplate: "linear-priority://{level}",
+    name: "Issues by Priority",
+    description: "Find Linear issues matching a specific priority level",
+    parameters: {
+      level: {
+        type: "string",
+        description: "Priority level (urgent, high, medium, low, or none)"
+      }
+    },
+    examples: [
+      "linear-priority://urgent",
+      "linear-priority://high"
     ]
   }
 ];
 
-const serverPrompt: Prompt = {
-  name: "linear-server-prompt",
-  description: "Instructions for using the Linear MCP server effectively",
-  instructions: `This server provides access to Linear, a project management tool. Use it to manage issues, track work, and coordinate with teams.
-
-Key capabilities:
-- Create and update issues: Create new tickets or modify existing ones with titles, descriptions, priorities, and team assignments.
-- Search functionality: Find issues across the organization using flexible search queries with team and user filters.
-- Team coordination: Access team-specific issues and manage work distribution within teams.
-- Issue tracking: Add comments and track progress through status updates and assignments.
-- Organization overview: View team structures and user assignments across the organization.
-
-Tool Usage:
-- linear_create_issue:
-  - use teamId from linear-organization: resource
-  - priority levels: 1=urgent, 2=high, 3=normal, 4=low
-  - status must match exact Linear workflow state names (e.g., "In Progress", "Done")
-
-- linear_update_issue:
-  - get issue IDs from search_issues or linear-issue:/// resources
-  - only include fields you want to change
-  - status changes must use valid state IDs from the team's workflow
-
-- linear_search_issues:
-  - combine multiple filters for precise results
-  - use labels array for multiple tag filtering
-  - query searches both title and description
-  - returns max 10 results by default
-
-- linear_get_user_issues:
-  - omit userId to get authenticated user's issues
-  - useful for workload analysis and sprint planning
-  - returns most recently updated issues first
-
-- linear_add_comment:
-  - supports full markdown formatting
-  - use displayIconUrl for bot/integration avatars
-  - createAsUser for custom comment attribution
-
-Best practices:
-- When creating issues:
-  - Write clear, actionable titles that describe the task well (e.g., "Implement user authentication for mobile app")
-  - Include concise but appropriately detailed descriptions in markdown format with context and acceptance criteria
-  - Set appropriate priority based on the context (1=critical to 4=nice-to-have)
-  - Always specify the correct team ID (default to the user's team if possible)
-
-- When searching:
-  - Use specific, targeted queries for better results (e.g., "auth mobile app" rather than just "auth")
-  - Apply relevant filters when asked or when you can infer the appropriate filters to narrow results
-
-- When adding comments:
-  - Use markdown formatting to improve readability and structure
-  - Keep content focused on the specific issue and relevant updates
-  - Include action items or next steps when appropriate
-
-- General best practices:
-  - Fetch organization data first to get valid team IDs
-  - Use search_issues to find issues for bulk operations
-  - Include markdown formatting in descriptions and comments
-
-Resource patterns:
-- linear-issue:///{issueId} - Single issue details (e.g., linear-issue:///c2b318fb-95d2-4a81-9539-f3268f34af87)
-- linear-team:///{teamId}/issues - Team's issue list (e.g., linear-team:///OPS/issues)
-- linear-user:///{userId}/assigned - User assignments (e.g., linear-user:///USER-123/assigned)
-- linear-organization: - Organization for the current user
-- linear-viewer: - Current user context
-
-The server uses the authenticated user's permissions for all operations.`
+const createIssuePrompt: Prompt = {
+  name: "create-issue",
+  description: "Create a well-structured Linear issue with all necessary details",
+  arguments: [
+    {
+      name: "issueType",
+      description: "Type of issue (bug, feature, task, etc.)",
+      required: false
+    },
+    {
+      name: "component",
+      description: "Component or area affected (UI, API, backend, etc.)",
+      required: false
+    }
+  ]
 };
 
-interface MCPMetricsResponse {
-  apiMetrics: {
-    requestsInLastHour: number;
-    remainingRequests: number;
-    averageRequestTime: string;
-    queueLength: number;
-  }
-}
+const bugReportPrompt: Prompt = {
+  name: "bug-report",
+  description: "File a detailed bug report with reproduction steps",
+  arguments: [
+    {
+      name: "severity",
+      description: "How severe is this bug (critical, high, medium, low)",
+      required: false
+    },
+    {
+      name: "browser",
+      description: "Browser info if relevant",
+      required: false
+    },
+    {
+      name: "platform",
+      description: "Platform info if relevant (OS, device, etc.)",
+      required: false
+    }
+  ]
+};
+
+const sprintPlanningPrompt: Prompt = {
+  name: "sprint-planning",
+  description: "Analyze and organize issues for sprint planning",
+  arguments: [
+    {
+      name: "teamId",
+      description: "ID of the team planning the sprint",
+      required: true
+    },
+    {
+      name: "sprintDuration",
+      description: "Duration of the sprint in weeks",
+      required: false
+    },
+    {
+      name: "sprintGoals",
+      description: "Primary goals for this sprint",
+      required: false
+    }
+  ]
+};
+
+const workStatusPrompt: Prompt = {
+  name: "work-status",
+  description: "Generate a status report of work items and progress",
+  arguments: [
+    {
+      name: "timeframe",
+      description: "Timeframe to report on (today, week, sprint)",
+      required: false
+    },
+    {
+      name: "userId",
+      description: "User ID to report on (defaults to current user)",
+      required: false
+    },
+    {
+      name: "format",
+      description: "Report format (summary, detailed)",
+      required: false
+    }
+  ]
+};
+
+const searchHelperPrompt: Prompt = {
+  name: "search-helper",
+  description: "Find issues with guided search parameters",
+  arguments: [
+    {
+      name: "keywords",
+      description: "Keywords to search for",
+      required: false
+    },
+    {
+      name: "identifier",
+      description: "Search by specific ticket identifier (e.g., 'ABC-123')",
+      required: false
+    },
+    {
+      name: "status",
+      description: "Issue status to filter by",
+      required: false
+    },
+    {
+      name: "assignee",
+      description: "Filter by assignee (username or 'me')",
+      required: false
+    },
+    {
+      name: "priority",
+      description: "Priority level (urgent, high, normal, low)",
+      required: false
+    }
+  ]
+};
+
+const linearPrompts = [
+  createIssuePrompt,
+  bugReportPrompt,
+  sprintPlanningPrompt,
+  workStatusPrompt,
+  searchHelperPrompt
+];
 
 // Zod schemas for tool argument validation
 const CreateIssueArgsSchema = z.object({
@@ -778,6 +838,7 @@ const UpdateIssueArgsSchema = z.object({
 
 const SearchIssuesArgsSchema = z.object({
   query: z.string().optional().describe("Optional text to search in title and description"),
+  identifier: z.string().optional().describe("Search by specific issue identifier (e.g., 'ABC-123')"),
   teamId: z.string().optional().describe("Filter by team ID"),
   status: z.string().optional().describe("Filter by status name (e.g., 'In Progress', 'Done')"),
   assigneeId: z.string().optional().describe("Filter by assignee's user ID"),
@@ -795,7 +856,7 @@ const GetUserIssuesArgsSchema = z.object({
 });
 
 const AddCommentArgsSchema = z.object({
-  issueId: z.string().describe("ID of the issue to comment on"),
+  identifier: z.string().describe("Linear issue identifier (e.g., 'ABC-123')"),
   body: z.string().describe("Comment text in markdown format"),
   createAsUser: z.string().optional().describe("Optional custom username to show for the comment"),
   displayIconUrl: z.string().optional().describe("Optional avatar URL for the comment")
@@ -807,11 +868,11 @@ async function main() {
 
     const apiKey = process.env.LINEAR_API_KEY;
     if (!apiKey) {
-      console.error("LINEAR_API_KEY environment variable is required");
+      logger.error("LINEAR_API_KEY environment variable is required");
       process.exit(1);
     }
 
-    console.error("Starting Linear MCP Server...");
+    logger.info("Starting Linear MCP Server...");
     const linearClient = new LinearMCPClient(apiKey);
 
     const server = new Server(
@@ -821,86 +882,357 @@ async function main() {
       },
       {
         capabilities: {
-          prompts: {
-            default: serverPrompt
-          },
+          prompts: {},
           resources: {
             templates: true,
             read: true
           },
           tools: {},
+          logging: {}
         },
       }
     );
 
-    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: await linearClient.listIssues()
-    }));
+    // Set the server in the logger
+    logger.setServer(server);
+
+    server.setRequestHandler(ListResourcesRequestSchema, async () => {
+      // Only include direct, parameterless resources
+      const resources = [
+        // User profile resource
+        {
+          uri: "linear-viewer://",
+          name: "Linear User Profile",
+          description: "Your Linear user profile information, including teams and permissions",
+          mimeType: "application/json"
+        },
+        // Organization resource
+        {
+          uri: "linear-organization://",
+          name: "Linear Organization",
+          description: "Details about your Linear organization, including teams and settings",
+          mimeType: "application/json"
+        },
+        // My issues resource
+        {
+          uri: "linear-my-issues://",
+          name: "My Linear Issues",
+          description: "All issues currently assigned to you",
+          mimeType: "application/json"
+        },
+        // My backlog issues
+        {
+          uri: "linear-my-backlog://",
+          name: "My Backlog Issues",
+          description: "Issues assigned to you in the Backlog",
+          mimeType: "application/json"
+        },
+        // My planned issues
+        {
+          uri: "linear-my-planned://",
+          name: "My Planned Issues",
+          description: "Issues assigned to you that are Planned this Cycle",
+          mimeType: "application/json"
+        },
+        // My in-progress issues
+        {
+          uri: "linear-my-in-progress://",
+          name: "My In-Progress Issues",
+          description: "Issues assigned to you that are currently in progress",
+          mimeType: "application/json"
+        },
+        // My under review issues
+        {
+          uri: "linear-my-under-review://",
+          name: "My Under Review Issues",
+          description: "Issues assigned to you that are under review",
+          mimeType: "application/json"
+        },
+        // My high priority issues
+        {
+          uri: "linear-my-high-priority://",
+          name: "My High Priority Issues",
+          description: "High priority issues assigned to you",
+          mimeType: "application/json"
+        }
+      ];
+
+      return {
+        resources,
+        resourceTemplates
+      };
+    });
 
     server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      const uri = new URL(request.params.uri);
-      const path = uri.pathname.replace(/^\//, '');
+      // Handle custom URI formats that don't work well with the URL constructor
+      const uri = request.params.uri;
 
-      if (uri.protocol === 'linear-organization') {
+      // Parse protocol and path manually for better handling of custom schemes
+      const protocolMatch = uri.match(/^([^:]+):\/\/(.*)/);
+
+      if (!protocolMatch) {
+        throw new Error(`Invalid URI format: ${uri}`);
+      }
+
+      const [, protocol, path] = protocolMatch;
+
+      // Handle fixed resources
+      if (protocol === 'linear-organization') {
         const organization = await linearClient.getOrganization();
         return {
           contents: [{
-            uri: "linear-organization:",
+            uri: "linear-organization://",
             mimeType: "application/json",
-            text: JSON.stringify(organization, null, 2)
+            text: JSON.stringify(organization)
           }]
         };
       }
 
-      if (uri.protocol === 'linear-viewer') {
+      if (protocol === 'linear-viewer') {
         const viewer = await linearClient.getViewer();
         return {
           contents: [{
-            uri: "linear-viewer:",
+            uri: "linear-viewer://",
             mimeType: "application/json",
-            text: JSON.stringify(viewer, null, 2)
+            text: JSON.stringify(viewer)
           }]
         };
       }
 
-      if (uri.protocol === 'linear-issue:') {
-        const issue = await linearClient.getIssue(path);
+      // Handle strategic collection resources
+      if (protocol === 'linear-my-issues') {
+        const issues = await linearClient.getUserIssues({
+          userId: undefined // current user
+        });
         return {
           contents: [{
-            uri: request.params.uri,
+            uri: "linear-my-issues://",
             mimeType: "application/json",
-            text: JSON.stringify(issue, null, 2)
+            text: JSON.stringify(issues)
           }]
         };
       }
 
-      if (uri.protocol === 'linear-team:') {
-        const [teamId] = path.split('/');
+      if (protocol === 'linear-my-backlog') {
+        // Get the current user's ID
+        const viewer = await linearClient.getViewer();
+
+        // Search for issues with the current user as assignee and "Backlog" status
+        const issues = await linearClient.searchIssues({
+          assigneeId: viewer.id,
+          status: "Backlog"
+        });
+
+        return {
+          contents: [{
+            uri: "linear-my-backlog://",
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      if (protocol === 'linear-my-planned') {
+        // Get the current user's ID
+        const viewer = await linearClient.getViewer();
+
+        // Search for issues with the current user as assignee and "Planned this Cycle" status
+        const issues = await linearClient.searchIssues({
+          assigneeId: viewer.id,
+          status: "Planned this Cycle"
+        });
+
+        return {
+          contents: [{
+            uri: "linear-my-planned://",
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      if (protocol === 'linear-my-in-progress') {
+        // Get the current user's ID
+        const viewer = await linearClient.getViewer();
+
+        // Search for issues with the current user as assignee and "In Progress" status
+        const issues = await linearClient.searchIssues({
+          assigneeId: viewer.id,
+          status: "In Progress"
+        });
+
+        return {
+          contents: [{
+            uri: "linear-my-in-progress://",
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      if (protocol === 'linear-my-under-review') {
+        // Get the current user's ID
+        const viewer = await linearClient.getViewer();
+
+        // Search for issues with the current user as assignee and "Under Review" status
+        const issues = await linearClient.searchIssues({
+          assigneeId: viewer.id,
+          status: "Under Review"
+        });
+
+        return {
+          contents: [{
+            uri: "linear-my-under-review://",
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      if (protocol === 'linear-my-high-priority') {
+        // Get the current user's ID
+        const viewer = await linearClient.getViewer();
+
+        // Search for high priority (1) issues with the current user as assignee
+        const urgentIssues = await linearClient.searchIssues({
+          assigneeId: viewer.id,
+          priority: 1
+        });
+
+        // Search for high priority (2) issues with the current user as assignee
+        const highIssues = await linearClient.searchIssues({
+          assigneeId: viewer.id,
+          priority: 2
+        });
+
+        // Combine both sets of issues
+        const issues = [...urgentIssues, ...highIssues];
+
+        return {
+          contents: [{
+            uri: "linear-my-high-priority://",
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      if (protocol === 'linear-recent-issues') {
+        // This is removed from resources list, but keeping the handler for backward compatibility
+        const issues = await linearClient.listIssues();
+        return {
+          contents: [{
+            uri: "linear-recent-issues://",
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      // Handle templated resources
+      if (protocol === 'linear-issue') {
+        const issueId = path;
+        if (!issueId) {
+          throw new Error("Issue ID is required for linear-issue resource");
+        }
+
+        const issue = await linearClient.getIssue(issueId);
+        return {
+          contents: [{
+            uri: `linear-issue://${issueId}`,
+            mimeType: "application/json",
+            text: JSON.stringify(issue)
+          }]
+        };
+      }
+
+      if (protocol === 'linear-team') {
+        const teamId = path;
+        if (!teamId) {
+          throw new Error("Team ID is required for linear-team resource");
+        }
+
         const issues = await linearClient.getTeamIssues(teamId);
         return {
           contents: [{
-            uri: request.params.uri,
+            uri: `linear-team://${teamId}`,
             mimeType: "application/json",
-            text: JSON.stringify(issues, null, 2)
+            text: JSON.stringify(issues)
           }]
         };
       }
 
-      if (uri.protocol === 'linear-user:') {
-        const [userId] = path.split('/');
+      if (protocol === 'linear-user') {
+        const userId = path;
+        if (!userId) {
+          throw new Error("User ID is required for linear-user resource");
+        }
+
         const issues = await linearClient.getUserIssues({
           userId: userId === 'me' ? undefined : userId
         });
         return {
           contents: [{
-            uri: request.params.uri,
+            uri: `linear-user://${userId}`,
             mimeType: "application/json",
-            text: JSON.stringify(issues, null, 2)
+            text: JSON.stringify(issues)
           }]
         };
       }
 
-      throw new Error(`Unsupported resource URI: ${request.params.uri}`);
+      if (protocol === 'linear-search') {
+        const query = path;
+        if (!query) {
+          throw new Error("Search query is required for linear-search resource");
+        }
+
+        // Check if query matches a Linear ticket ID pattern (e.g., "ABC-123")
+        const isTicketId = /^[A-Z]+-\d+$/.test(query);
+
+        const issues = isTicketId
+          ? await linearClient.searchIssues({ identifier: query })
+          : await linearClient.searchIssues({ query });
+
+        return {
+          contents: [{
+            uri: `linear-search://${query}`,
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      if (protocol === 'linear-priority') {
+        const level = path;
+        if (!level) {
+          throw new Error("Priority level is required for linear-priority resource");
+        }
+
+        // Map priority levels to Linear's numeric priority values
+        const priorityMap: Record<string, number> = {
+          'urgent': 1,
+          'high': 2,
+          'medium': 3,
+          'low': 4,
+          'none': 0
+        };
+
+        const priority = priorityMap[level.toLowerCase()];
+        if (priority === undefined) {
+          throw new Error(`Invalid priority level: ${level}. Valid values are: urgent, high, medium, low, none`);
+        }
+
+        const issues = await linearClient.searchIssues({ priority });
+        return {
+          contents: [{
+            uri: `linear-priority://${level}`,
+            mimeType: "application/json",
+            text: JSON.stringify(issues)
+          }]
+        };
+      }
+
+      throw new Error(`Unsupported resource URI: ${uri}`);
     });
 
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -915,42 +1247,202 @@ async function main() {
 
     server.setRequestHandler(ListPromptsRequestSchema, async () => {
       return {
-        prompts: [serverPrompt]
+        prompts: linearPrompts
       };
     });
 
     server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-      if (request.params.name === serverPrompt.name) {
+      logger.info(`GetPromptRequestSchema ${JSON.stringify(request)}`);
+
+      if (request.params.name === createIssuePrompt.name) {
+        const issueType = request.params.arguments?.issueType || "task";
+        const component = request.params.arguments?.component || "";
+
         return {
-          prompt: serverPrompt
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: `I need to create a new ${issueType} in Linear${component ? ` for the ${component} component` : ""}.`
+              }
+            },
+            {
+              role: "assistant",
+              content: {
+                type: "text",
+                text: `I'll help you create a new ${issueType}${component ? ` for ${component}` : ""}. Let's gather the necessary details:
+
+1. What should be the title of this ${issueType}?
+2. Please provide a description with all relevant details${issueType === "bug" ? ", including reproduction steps" : ""}.
+3. Which team should this be assigned to?
+4. What priority level would you assign (urgent, high, normal, low)?
+5. Any specific status you want to set initially?`
+              }
+            }
+          ]
         };
       }
+
+      if (request.params.name === bugReportPrompt.name) {
+        const severity = request.params.arguments?.severity || "medium";
+        const browser = request.params.arguments?.browser || "";
+        const platform = request.params.arguments?.platform || "";
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: `I need to file a ${severity} severity bug report${browser ? ` affecting ${browser}` : ""}${platform ? ` on ${platform}` : ""}.`
+              }
+            },
+            {
+              role: "assistant",
+              content: {
+                type: "text",
+                text: `I'll help you create a detailed bug report. Please provide the following information:
+
+1. Bug title: (Brief summary of the issue)
+2. Reproduction steps:
+   - Step 1:
+   - Step 2:
+   - ...
+3. Expected behavior:
+4. Actual behavior:
+5. Screenshots/videos: (if available)
+6. Additional context:${browser ? `\n7. Browser: ${browser}` : ""}${platform ? `\n8. Platform: ${platform}` : ""}
+
+Once you provide this information, I'll help you create a well-structured bug report in Linear with the appropriate priority level (${severity}).`
+              }
+            }
+          ]
+        };
+      }
+
+      if (request.params.name === sprintPlanningPrompt.name) {
+        const teamId = request.params.arguments?.teamId;
+        const sprintDuration = request.params.arguments?.sprintDuration || "2";
+        const sprintGoals = request.params.arguments?.sprintGoals || "";
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: `I need help planning a ${sprintDuration}-week sprint for team ${teamId}${sprintGoals ? ` with these goals: ${sprintGoals}` : ""}.`
+              }
+            },
+            {
+              role: "assistant",
+              content: {
+                type: "text",
+                text: `I'll help you plan your ${sprintDuration}-week sprint for team ${teamId}. Let me gather some information about the current backlog and in-progress work.
+
+First, I'll need to:
+1. Check existing issues for team ${teamId}
+2. Analyze current workload distribution
+3. Review any carried-over work from previous sprints
+
+${sprintGoals ? `Based on your sprint goals (${sprintGoals}), ` : ""}Would you like me to:
+- Suggest issues to include in this sprint?
+- Help prioritize existing backlog items?
+- Analyze team capacity?
+- Create sprint planning meeting notes?`
+              }
+            }
+          ]
+        };
+      }
+
+      if (request.params.name === workStatusPrompt.name) {
+        const timeframe = request.params.arguments?.timeframe || "week";
+        const userId = request.params.arguments?.userId || "me";
+        const format = request.params.arguments?.format || "summary";
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: `Generate a ${format} work status report for ${userId === "me" ? "my" : userId + "'s"} tasks over the past ${timeframe}.`
+              }
+            },
+            {
+              role: "assistant",
+              content: {
+                type: "text",
+                text: `I'll generate a ${format} work status report for ${userId === "me" ? "your" : userId + "'s"} tasks over the past ${timeframe}.
+
+I'll analyze:
+- Completed issues
+- In-progress work
+- Upcoming/planned tasks
+- Any blockers or dependencies
+
+Would you like me to include any specific information in this report, such as time estimates or specific projects?`
+              }
+            }
+          ]
+        };
+      }
+
+      if (request.params.name === searchHelperPrompt.name) {
+        const keywords = request.params.arguments?.keywords || "";
+        const identifier = request.params.arguments?.identifier || "";
+        const status = request.params.arguments?.status || "";
+        const assignee = request.params.arguments?.assignee || "";
+        const priority = request.params.arguments?.priority || "";
+
+        let searchQuery = "I need to find issues";
+        if (identifier) {
+          searchQuery = `I need to find the Linear ticket ${identifier}`;
+        } else {
+          if (keywords) searchQuery += ` containing "${keywords}"`;
+          if (status) searchQuery += ` with status "${status}"`;
+          if (assignee) searchQuery += ` assigned to ${assignee === "me" ? "me" : assignee}`;
+          if (priority) searchQuery += ` with ${priority} priority`;
+        }
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: searchQuery
+              }
+            },
+            {
+              role: "assistant",
+              content: {
+                type: "text",
+                text: identifier
+                  ? `I'll search for the specific Linear ticket with ID: ${identifier}`
+                  : `I'll help you search for issues in Linear with these criteria:
+${keywords ? `- Keywords: "${keywords}"\n` : ""}${status ? `- Status: "${status}"\n` : ""}${assignee ? `- Assignee: ${assignee === "me" ? "You" : assignee}\n` : ""}${priority ? `- Priority: ${priority}\n` : ""}
+
+Would you like to:
+1. Add any other search filters?
+2. Sort results in a specific way?
+3. Limit the number of results?
+4. Include archived issues?`
+              }
+            }
+          ]
+        };
+      }
+
       throw new Error(`Prompt not found: ${request.params.name}`);
     });
 
-    server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
-      let metrics: RateLimiterMetrics = {
-        totalRequests: 0,
-        requestsInLastHour: 0,
-        averageRequestTime: 0,
-        queueLength: 0,
-        lastRequestTime: Date.now()
-      };
-
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
       try {
         const { name, arguments: args } = request.params;
         if (!args) throw new Error("Missing arguments");
-
-        metrics = linearClient.rateLimiter.getMetrics();
-
-        const baseResponse: MCPMetricsResponse = {
-          apiMetrics: {
-            requestsInLastHour: metrics.requestsInLastHour,
-            remainingRequests: linearClient.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
-            averageRequestTime: `${Math.round(metrics.averageRequestTime)}ms`,
-            queueLength: metrics.queueLength
-          }
-        };
 
         switch (name) {
           case "linear_create_issue": {
@@ -960,7 +1452,6 @@ async function main() {
               content: [{
                 type: "text",
                 text: `Created issue ${issue.identifier}: ${issue.title}\nURL: ${issue.url}`,
-                metadata: baseResponse
               }]
             };
           }
@@ -972,25 +1463,58 @@ async function main() {
               content: [{
                 type: "text",
                 text: `Updated issue ${issue.identifier}\nURL: ${issue.url}`,
-                metadata: baseResponse
               }]
             };
           }
 
           case "linear_search_issues": {
-            const validatedArgs = SearchIssuesArgsSchema.parse(args);
-            const issues = await linearClient.searchIssues(validatedArgs);
-            return {
-              content: [{
-                type: "text",
-                text: `Found ${issues.length} issues:\n${
-                  issues.map((issue: LinearIssueResponse) =>
-                    `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.status || 'None'}\n  ${issue.url}`
-                  ).join('\n')
-                }`,
-                metadata: baseResponse
-              }]
-            };
+            try {
+              // Validate arguments before using them
+              const validatedArgs = SearchIssuesArgsSchema.parse(args);
+              const issues = await linearClient.searchIssues(validatedArgs);
+              logger.info(`Found ${issues.length} issues for search`);
+
+              // Create the response text
+              const issueList = issues.map((issue: LinearIssueResponse) => {
+                // Format description with a max length to avoid overly long outputs
+                const description = issue.description
+                  ? `\n  Description: ${issue.description.length > 150
+                      ? issue.description.substring(0, 150) + '...'
+                      : issue.description}`
+                  : '';
+
+                // Format latest comment if available
+                const commentText = issue.latestComment
+                  ? `\n  Latest Comment (${issue.latestComment.userName}): ${
+                      issue.latestComment.body.length > 150
+                        ? issue.latestComment.body.substring(0, 150) + '...'
+                        : issue.latestComment.body
+                    }`
+                  : '';
+
+                return `- ${issue.identifier}: ${issue.title}
+  Priority: ${issue.priority || 'None'}
+  Status: ${issue.status || 'None'}
+  ${issue.assignee ? `Assignee: ${issue.assignee}` : ''}
+  ${issue.labels && issue.labels.length > 0 ? `Labels: ${issue.labels.join(', ')}` : ''}${description}${commentText}
+  ${issue.url}`;
+              }).join('\n\n');
+
+              return {
+                content: [{
+                  type: "text",
+                  text: `Found ${issues.length} issues:\n${issueList}`
+                }]
+              };
+            } catch (error: any) {
+              logger.error(`Error in linear_search_issues: ${error.message}`);
+              return {
+                content: [{
+                  type: "text",
+                  text: `Error searching for issues: ${error.message}`
+                }]
+              };
+            }
           }
 
           case "linear_get_user_issues": {
@@ -1002,23 +1526,21 @@ async function main() {
                 type: "text",
                 text: `Found ${issues.length} issues:\n${
                   issues.map((issue: LinearIssueResponse) =>
-                    `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.stateName}\n  ${issue.url}`
+                    `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.status || 'None'}\n  ${issue.url}`
                   ).join('\n')
                 }`,
-                metadata: baseResponse
               }]
             };
           }
 
           case "linear_add_comment": {
             const validatedArgs = AddCommentArgsSchema.parse(args);
-            const { comment, issue } = await linearClient.addComment(validatedArgs);
+            const result = await linearClient.addComment(validatedArgs);
 
             return {
               content: [{
                 type: "text",
-                text: `Added comment to issue ${issue?.identifier}\nURL: ${comment.url}`,
-                metadata: baseResponse
+                text: `Added comment to issue ${result.issue?.identifier || "unknown"}\nURL: ${result.commentUrl}`,
               }]
             };
           }
@@ -1027,25 +1549,15 @@ async function main() {
             throw new Error(`Unknown tool: ${name}`);
         }
       } catch (error) {
-        console.error("Error executing tool:", error);
+        logger.error(`Error executing tool: ${error}`);
 
-        const errorResponse: MCPMetricsResponse = {
-          apiMetrics: {
-            requestsInLastHour: metrics.requestsInLastHour,
-            remainingRequests: linearClient.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
-            averageRequestTime: `${Math.round(metrics.averageRequestTime)}ms`,
-            queueLength: metrics.queueLength
-          }
-        };
-
-        // If it's a Zod error, format it nicely
         if (error instanceof z.ZodError) {
           const formattedErrors = error.errors.map(err => ({
             path: err.path,
             message: err.message,
             code: 'VALIDATION_ERROR'
           }));
-          
+
           return {
             content: [{
               type: "text",
@@ -1056,40 +1568,33 @@ async function main() {
                   details: formattedErrors
                 }
               },
-              metadata: {
-                error: true,
-                ...errorResponse
-              }
-            }]
+            }],
+            metadata: {
+              error: true
+            }
           };
         }
 
-        // For Linear API errors, try to extract useful information
         if (error instanceof Error && 'response' in error) {
           return {
-            content: [{
-              type: "text",
-              text: {
-                error: {
-                  type: 'API_ERROR',
-                  message: error.message,
-                  details: {
-                    // @ts-ignore - response property exists but isn't in type
-                    status: error.response?.status,
-                    // @ts-ignore - response property exists but isn't in type
-                    data: error.response?.data
+            error: {
+              code: "linear_api_error",
+              content: [
+                {
+                  type: "text",
+                  text: {
+                    message: error.message,
+                    details: {
+                      status: (error.response as any)?.status,
+                      data: (error.response as any)?.data
+                    }
                   }
                 }
-              },
-              metadata: {
-                error: true,
-                ...errorResponse
-              }
-            }]
+              ]
+            }
           };
         }
 
-        // For all other errors
         return {
           content: [{
             type: "text",
@@ -1099,26 +1604,29 @@ async function main() {
                 message: error instanceof Error ? error.message : String(error)
               }
             },
-            metadata: {
-              error: true,
-              ...errorResponse
-            }
-          }]
+          }],
+          metadata: {
+            error: true
+          }
         };
       }
     });
 
     const transport = new StdioServerTransport();
-    console.error("Connecting server to transport...");
+    logger.info("Connecting server to transport...");
     await server.connect(transport);
-    console.error("Linear MCP Server running on stdio");
+
+    // Now that the server is connected, we can set the flag to true
+    logger.setServerConnected(true);
+
+    logger.info("Linear MCP Server running on stdio");
   } catch (error) {
-    console.error(`Fatal error in main(): ${error instanceof Error ? error.message : String(error)}`);
+    logger.error(`Fatal error in main(): ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
 }
 
 main().catch((error: unknown) => {
-  console.error("Fatal error in main():", error instanceof Error ? error.message : String(error));
+  logger.error(`Fatal error in main(): ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });
